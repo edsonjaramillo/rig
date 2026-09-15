@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -118,6 +120,38 @@ func selectedInstallTargets(args []string) []InstallTarget {
 	return []InstallTarget{InstallTarget(args[0])}
 }
 
+func validateSupportedPlatform(platform Platform, target InstallTarget) error {
+	majorText := strings.SplitN(strings.TrimSpace(platform.Version), ".", 2)[0]
+	major, err := strconv.Atoi(majorText)
+	if err != nil {
+		return fmt.Errorf("unsupported platform for %s: %s %s %s", target, platform.OS, platform.Architecture, platform.Version)
+	}
+
+	supported := platform.OS == "darwin" && platform.Architecture == "arm64" && major >= 15 ||
+		platform.OS == "linux" && strings.EqualFold(platform.Distribution, "ubuntu") && major >= 24 &&
+			(platform.Architecture == "amd64" || platform.Architecture == "arm64" ||
+				platform.Architecture == "x86_64" || platform.Architecture == "aarch64")
+	if !supported {
+		return fmt.Errorf("unsupported platform for %s: %s %s %s", target, platform.OS, platform.Architecture, platform.Version)
+	}
+	return nil
+}
+
+func missingPrerequisites(host Host, target InstallTarget, executables []string) ([]string, error) {
+	missing := make([]string, 0)
+	for _, executable := range executables {
+		_, err := host.LookPath(executable)
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrNotFound):
+			missing = append(missing, executable)
+		default:
+			return nil, fmt.Errorf("inspect %s prerequisite %s: %w", target, executable, err)
+		}
+	}
+	return missing, nil
+}
+
 func ensureInstalled(ctx context.Context, host Host, streams Streams, target InstallTarget) error {
 	spec := installTargets[target]
 
@@ -152,13 +186,14 @@ func ensureInstalled(ctx context.Context, host Host, streams Streams, target Ins
 		}
 	}
 
-	if target == Homebrew {
+	switch target {
+	case Nix:
+		return bootstrapNix(ctx, host, streams)
+	case Homebrew:
 		return bootstrapHomebrew(ctx, host, streams)
+	default:
+		return fmt.Errorf("bootstrap %s: unsupported install target", target)
 	}
-	if err := host.Bootstrap(ctx, target, streams); err != nil {
-		return fmt.Errorf("bootstrap %s: %w", target, err)
-	}
-	return nil
 }
 
 func checkVersion(ctx context.Context, host Host, target InstallTarget, executable string) error {

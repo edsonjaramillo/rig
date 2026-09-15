@@ -10,25 +10,28 @@ import (
 )
 
 type fakeHost struct {
-	platform       Platform
-	platformError  error
-	user           User
-	userError      error
-	terminal       bool
-	lookPaths      map[string]string
-	lookPathErrors map[string]error
-	pathInfo       map[string]PathInfo
-	pathErrors     map[string]error
-	response       HTTPResponse
-	retrieveError  error
-	artifact       TemporaryArtifact
-	createTempErr  error
-	sudoError      error
-	runErrors      map[string]error
-	runHook        func(Command)
-	calls          []string
-	bootstrapped   []InstallTarget
-	bootstrapError error
+	platform         Platform
+	platformError    error
+	user             User
+	userError        error
+	terminal         bool
+	lookPaths        map[string]string
+	lookPathErrors   map[string]error
+	pathInfo         map[string]PathInfo
+	pathErrors       map[string]error
+	response         HTTPResponse
+	responses        map[string]HTTPResponse
+	retrieveError    error
+	retrieveErrors   map[string]error
+	artifact         TemporaryArtifact
+	artifacts        map[string]TemporaryArtifact
+	createTempErr    error
+	createTempErrors map[string]error
+	sudoError        error
+	runErrors        map[string]error
+	runErrorHook     func(Command) error
+	runHook          func(Command)
+	calls            []string
 }
 
 func (h *fakeHost) Platform(context.Context) (Platform, error) {
@@ -48,11 +51,23 @@ func (h *fakeHost) IsTerminal() bool {
 
 func (h *fakeHost) Retrieve(_ context.Context, address string) (HTTPResponse, error) {
 	h.calls = append(h.calls, "retrieve:"+address)
+	if err := h.retrieveErrors[address]; err != nil {
+		return HTTPResponse{}, err
+	}
+	if response, ok := h.responses[address]; ok {
+		return response, nil
+	}
 	return h.response, h.retrieveError
 }
 
 func (h *fakeHost) CreateTemp(pattern string) (TemporaryArtifact, error) {
 	h.calls = append(h.calls, "create-temp:"+pattern)
+	if err := h.createTempErrors[pattern]; err != nil {
+		return TemporaryArtifact{}, err
+	}
+	if artifact, ok := h.artifacts[pattern]; ok {
+		return artifact, nil
+	}
 	return h.artifact, h.createTempErr
 }
 
@@ -85,13 +100,10 @@ func (h *fakeHost) Run(_ context.Context, command Command) error {
 	if h.runHook != nil {
 		h.runHook(command)
 	}
+	if h.runErrorHook != nil {
+		return h.runErrorHook(command)
+	}
 	return h.runErrors[command.Path]
-}
-
-func (h *fakeHost) Bootstrap(_ context.Context, target InstallTarget, _ Streams) error {
-	h.calls = append(h.calls, "bootstrap:"+string(target))
-	h.bootstrapped = append(h.bootstrapped, target)
-	return h.bootstrapError
 }
 
 func executeForTest(host Host, args ...string) (int, string, string) {
@@ -109,11 +121,15 @@ func executeForTest(host Host, args ...string) (int, string, string) {
 
 func newFakeHost() *fakeHost {
 	return &fakeHost{
-		lookPaths:      make(map[string]string),
-		lookPathErrors: make(map[string]error),
-		pathInfo:       make(map[string]PathInfo),
-		pathErrors:     make(map[string]error),
-		runErrors:      make(map[string]error),
+		lookPaths:        make(map[string]string),
+		lookPathErrors:   make(map[string]error),
+		pathInfo:         make(map[string]PathInfo),
+		pathErrors:       make(map[string]error),
+		responses:        make(map[string]HTTPResponse),
+		retrieveErrors:   make(map[string]error),
+		artifacts:        make(map[string]TemporaryArtifact),
+		createTempErrors: make(map[string]error),
+		runErrors:        make(map[string]error),
 	}
 }
 
@@ -121,13 +137,13 @@ func TestInstallAcceptsIntendedCommandShapes(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name                     string
-		args                     []string
-		wantHostBootstrapTargets []InstallTarget
-		wantHomebrew             bool
+		name         string
+		args         []string
+		wantNix      bool
+		wantHomebrew bool
 	}{
-		{name: "bare install", args: []string{"install"}, wantHostBootstrapTargets: []InstallTarget{Nix}, wantHomebrew: true},
-		{name: "nix", args: []string{"install", "nix"}, wantHostBootstrapTargets: []InstallTarget{Nix}},
+		{name: "bare install", args: []string{"install"}, wantNix: true, wantHomebrew: true},
+		{name: "nix", args: []string{"install", "nix"}, wantNix: true},
 		{name: "homebrew", args: []string{"install", "homebrew"}, wantHomebrew: true},
 	}
 
@@ -135,6 +151,7 @@ func TestInstallAcceptsIntendedCommandShapes(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			host, _, _ := newReadyHomebrewHost()
+			_ = makeNixReady(host)
 
 			exitCode, stdout, stderr := executeForTest(host, test.args...)
 
@@ -144,11 +161,22 @@ func TestInstallAcceptsIntendedCommandShapes(t *testing.T) {
 			if stdout != "" || stderr != "" {
 				t.Fatalf("output = stdout %q, stderr %q; want silence", stdout, stderr)
 			}
-			if got := host.bootstrapped; !slices.Equal(got, test.wantHostBootstrapTargets) {
-				t.Fatalf("host bootstrap targets = %v, want %v", got, test.wantHostBootstrapTargets)
+			if got := containsCallPrefix(host.calls, "run:/bin/bash "+testNixInstallerPath); got != test.wantNix {
+				t.Fatalf("Nix installer called = %t, want %t; calls = %v", got, test.wantNix, host.calls)
 			}
-			if got := containsCallPrefix(host.calls, "run:/bin/bash"); got != test.wantHomebrew {
+			if got := containsCallPrefix(host.calls, "run:/bin/bash /tmp/rig-homebrew-test"); got != test.wantHomebrew {
 				t.Fatalf("Homebrew installer called = %t, want %t; calls = %v", got, test.wantHomebrew, host.calls)
+			}
+			if test.wantNix && test.wantHomebrew {
+				nixCall := slices.IndexFunc(host.calls, func(call string) bool {
+					return strings.HasPrefix(call, "run:/bin/bash "+testNixInstallerPath)
+				})
+				homebrewCall := slices.IndexFunc(host.calls, func(call string) bool {
+					return strings.HasPrefix(call, "run:/bin/bash /tmp/rig-homebrew-test")
+				})
+				if nixCall < 0 || homebrewCall < 0 || nixCall >= homebrewCall {
+					t.Fatalf("calls = %v, want Nix installer before Homebrew installer", host.calls)
+				}
 			}
 		})
 	}
@@ -238,8 +266,8 @@ func TestInstallReportsBrokenInstallationWithoutOverwritingIt(t *testing.T) {
 	if !strings.Contains(stderr, "broken installation") || strings.Contains(stderr, "Usage:") {
 		t.Fatalf("stderr = %q, want broken installation without usage", stderr)
 	}
-	if len(host.bootstrapped) != 0 {
-		t.Fatalf("bootstrapped = %v, want none", host.bootstrapped)
+	if containsCallPrefix(host.calls, "retrieve:") {
+		t.Fatalf("calls = %v, broken installation must not be overwritten", host.calls)
 	}
 }
 
@@ -269,8 +297,8 @@ func TestInstallReportsPartialInstallationWithoutOverwritingIt(t *testing.T) {
 			if !strings.Contains(stderr, "partial installation") || strings.Contains(stderr, "Usage:") {
 				t.Fatalf("stderr = %q, want partial installation without usage", stderr)
 			}
-			if len(host.bootstrapped) != 0 {
-				t.Fatalf("bootstrapped = %v, want none", host.bootstrapped)
+			if containsCallPrefix(host.calls, "retrieve:") {
+				t.Fatalf("calls = %v, partial installation must not be overwritten", host.calls)
 			}
 		})
 	}

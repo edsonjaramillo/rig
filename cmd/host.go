@@ -30,7 +30,6 @@ type Host interface {
 	CreateTemp(string) (TemporaryArtifact, error)
 	ValidateSudo(context.Context) error
 	Run(context.Context, Command) error
-	Bootstrap(context.Context, InstallTarget, Streams) error
 }
 
 // PathInfo describes relevant filesystem state without following absent symlink targets.
@@ -297,9 +296,4 @@ func configureChild(child *exec.Cmd, command Command) {
 	child.Stdin = command.Stdin
 	child.Stdout = command.Stdout
 	child.Stderr = command.Stderr
-}
-
-// Bootstrap is the extension point for package-manager installation slices.
-func (h *OSHost) Bootstrap(_ context.Context, target InstallTarget, _ Streams) error {
-	return fmt.Errorf("%s bootstrap is not implemented", target)
 }
