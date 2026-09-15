@@ -1,30 +1,60 @@
 package cmd
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
 )
 
-// rootCmd represents the base command when called without any subcommands
-var rootCmd = &cobra.Command{
-	Use:   "rig",
-	Short: "A brief description of your application",
-	Long: `A longer description that spans multiple lines and likely contains
-examples and usage of using your application. For example:
-
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
-}
-
-func Execute() {
-	err := rootCmd.Execute()
-	if err != nil {
-		os.Exit(1)
+// Run executes the real Rig command tree with an injected host and streams.
+func Run(ctx context.Context, host Host, args []string, streams Streams) int {
+	if err := validateInstallHelpArgs(args); err != nil {
+		writeUsageError(streams.Stderr, err)
+		return 2
 	}
+
+	root := newRootCommand(host, streams)
+	root.SetArgs(args)
+	root.SetIn(streams.Stdin)
+	root.SetOut(streams.Stdout)
+	root.SetErr(streams.Stderr)
+
+	err := root.ExecuteContext(ctx)
+	if err == nil {
+		return 0
+	}
+
+	var invalidUsage *usageError
+	if errors.As(err, &invalidUsage) {
+		writeUsageError(streams.Stderr, err)
+		return 2
+	}
+
+	_, _ = fmt.Fprintf(streams.Stderr, "Error: %s\n", err)
+	return 1
 }
 
-func init() {
-	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+// Execute runs Rig against the local operating system and exits with its status.
+func Execute() {
+	streams := Streams{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr}
+	os.Exit(Run(context.Background(), NewOSHost(streams), os.Args[1:], streams))
+}
+
+func writeUsageError(stderr io.Writer, err error) {
+	_, _ = fmt.Fprintf(stderr, "Error: %s\nUsage: rig %s\n", err, installUse)
+}
+
+func newRootCommand(host Host, streams Streams) *cobra.Command {
+	root := &cobra.Command{
+		Use:           "rig",
+		Short:         "Bootstrap and manage developer-machine tooling",
+		SilenceErrors: true,
+		SilenceUsage:  true,
+	}
+	root.AddCommand(newInstallCommand(host, streams))
+	return root
 }
