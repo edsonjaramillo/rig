@@ -9,8 +9,14 @@ vars:
   LIMA_GUEST: ubuntu
   LIMA_INSTANCE: '{{if eq .LIMA_GUEST "macos"}}rig-macos-26{{else}}rig-ubuntu-2604{{end}}'
   LIMA_TEMPLATE: '{{if eq .LIMA_GUEST "macos"}}macos-26{{else}}ubuntu-26.04{{end}}'
+  # Lima snapshots require QEMU; macOS guests require Virtualization.framework.
+  LIMA_VM_TYPE: '{{if eq .LIMA_GUEST "macos"}}vz{{else}}qemu{{end}}'
   LIMA_WORKDIR: /tmp/rig
   LIMA_SNAPSHOT: clean
+  LIMA_SSH_CONFIG: ~/.lima/{{.LIMA_INSTANCE}}/ssh.config
+  LIMA_SSH_HOST: lima-{{.LIMA_INSTANCE}}
+  NIX_EXECUTABLE: /nix/var/nix/profiles/default/bin/nix
+  HOMEBREW_EXECUTABLE: /home/linuxbrew/.linuxbrew/bin/brew
 tasks:
   default:
     cmd: go run {{.MAIN}} {{.CLI_ARGS}}
@@ -38,6 +44,7 @@ tasks:
     cmd: >-
       limactl start
       --name {{.LIMA_INSTANCE}}
+      --vm-type {{.LIMA_VM_TYPE}}
       --mount-none
       --containerd=none
       --cpus 4
@@ -64,30 +71,46 @@ tasks:
       command -v brew || echo "Homebrew not installed"'
 
   lima:snapshot:
-    desc: Snapshot the clean VM before running installers
-    cmd: limactl snapshot create {{.LIMA_INSTANCE}} --tag {{.LIMA_SNAPSHOT}}
-
-  lima:copy:
-    desc: Copy the current source tree into the VM
+    desc: Refresh the clean VM snapshot after readiness checks
     cmds:
-      - limactl shell {{.LIMA_INSTANCE}} -- rm -rf {{.LIMA_WORKDIR}}
-      - limactl copy -r . {{.LIMA_INSTANCE}}:{{.LIMA_WORKDIR}}
+      - limactl stop {{.LIMA_INSTANCE}}
+      - >-
+        if limactl snapshot list {{.LIMA_INSTANCE}} --quiet | grep -Fqx {{.LIMA_SNAPSHOT}}; then
+          limactl snapshot delete {{.LIMA_INSTANCE}} --tag {{.LIMA_SNAPSHOT}};
+        fi
+      - limactl snapshot create {{.LIMA_INSTANCE}} --tag {{.LIMA_SNAPSHOT}}
+      - limactl start {{.LIMA_INSTANCE}}
 
   lima:build:
-    desc: Install Go in the VM, copy the source, and build rig
-    deps: [lima:copy]
+    desc: Cross-compile Rig on the host and copy only its guest-native binary
     cmds:
-      - limactl shell {{.LIMA_INSTANCE}} -- sudo apt-get update
-      - limactl shell {{.LIMA_INSTANCE}} -- sudo apt-get install -y golang-go
-      - >-
-        limactl shell {{.LIMA_INSTANCE}} -- bash -lc
-        'cd {{.LIMA_WORKDIR}} && go build -o {{.EXECUTABLE}} {{.MAIN}}'
+      - |
+        set -eu
+        guest_os=$(limactl shell {{.LIMA_INSTANCE}} -- uname -s)
+        guest_arch=$(limactl shell {{.LIMA_INSTANCE}} -- uname -m)
+        case "$guest_os" in
+          Linux) goos=linux ;;
+          Darwin) goos=darwin ;;
+          *) echo "Unsupported Lima guest operating system: $guest_os" >&2; exit 1 ;;
+        esac
+        case "$guest_arch" in
+          x86_64) goarch=amd64 ;;
+          aarch64|arm64) goarch=arm64 ;;
+          *) echo "Unsupported Lima guest architecture: $guest_arch" >&2; exit 1 ;;
+        esac
+        build_dir=$(mktemp -d)
+        trap 'rm -rf "$build_dir"' EXIT
+        CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -o "$build_dir/{{.EXECUTABLE}}" {{.MAIN}}
+        limactl shell {{.LIMA_INSTANCE}} -- rm -rf {{.LIMA_WORKDIR}}
+        limactl shell {{.LIMA_INSTANCE}} -- mkdir -p {{.LIMA_WORKDIR}}
+        limactl copy "$build_dir/{{.EXECUTABLE}}" {{.LIMA_INSTANCE}}:{{.LIMA_WORKDIR}}/{{.EXECUTABLE}}
+        limactl shell {{.LIMA_INSTANCE}} -- bash -lc 'test -O {{.LIMA_WORKDIR}}/{{.EXECUTABLE}}'
 
   lima:run:
-    desc: Run rig in the VM; pass arguments after --
+    desc: Run Rig as the regular Lima user in an attached guest terminal; pass arguments after --
     cmd: >-
-      limactl shell {{.LIMA_INSTANCE}} -- bash -lc
-      'cd {{.LIMA_WORKDIR}} && sudo ./{{.EXECUTABLE}} {{.CLI_ARGS}}'
+      ssh -tt -F {{.LIMA_SSH_CONFIG}} {{.LIMA_SSH_HOST}}
+      {{.LIMA_WORKDIR}}/{{.EXECUTABLE}} {{.CLI_ARGS}}
 
   lima:verify:
     desc: Verify Nix and Homebrew after installation
@@ -98,18 +121,177 @@ tasks:
       nix doctor'
 
   lima:reset:
-    desc: Restore the VM to its clean snapshot
+    desc: Explicitly restore the VM to its prepared clean snapshot
     cmds:
       - limactl stop {{.LIMA_INSTANCE}}
       - limactl snapshot apply {{.LIMA_INSTANCE}} --tag {{.LIMA_SNAPSHOT}}
       - limactl start {{.LIMA_INSTANCE}}
 
   lima:delete:
-    desc: Delete the disposable VM
+    desc: Explicitly delete the disposable VM
     prompt: This will delete the {{.LIMA_INSTANCE}} VM. Continue?
     cmds:
       - limactl stop {{.LIMA_INSTANCE}}
       - limactl delete {{.LIMA_INSTANCE}}
+
+  lima:ubuntu:create:
+    desc: Create the snapshot-capable Ubuntu 26.04 QEMU guest
+    cmds:
+      - task: lima:create
+        vars:
+          LIMA_GUEST: ubuntu
+          LIMA_INSTANCE: rig-ubuntu-2604
+          LIMA_TEMPLATE: ubuntu-26.04
+          LIMA_VM_TYPE: qemu
+
+  lima:ubuntu:prepare:
+    desc: 'DESTRUCTIVE: prepare pristine Ubuntu prerequisites and refresh the clean snapshot'
+    preconditions:
+      - sh: limactl list {{.LIMA_INSTANCE}} --json | grep -q '"vmType":"qemu"'
+        msg: 'Ubuntu snapshot workflows require a QEMU instance; explicitly delete and recreate it with task lima:ubuntu:create'
+    cmds:
+      - |
+        set -eu
+        limactl shell {{.LIMA_INSTANCE}} -- sudo apt-get update
+        limactl shell {{.LIMA_INSTANCE}} -- sudo apt-get install -y \
+          bash ca-certificates coreutils curl diffutils file findutils gawk git grep \
+          build-essential libc-bin passwd procps sed sudo systemd tar xz-utils
+        limactl shell {{.LIMA_INSTANCE}} -- sudo apt-get purge -y golang-go golang-src
+        limactl shell {{.LIMA_INSTANCE}} -- sudo apt-get autoremove -y
+      - |
+        limactl shell {{.LIMA_INSTANCE}} -- bash -lc '
+          set -eu
+          test "$(id -u)" -ne 0
+          test "$(systemctl is-system-running)" = running || test "$(systemctl is-system-running)" = degraded
+          for executable in awk bash cat chmod chown cp cut diff dirname env getent git grep groupadd groups head id install ln mkdir mktemp mv rm sed seq sha256sum sleep sudo systemctl systemd-tmpfiles tar tee touch tr uname useradd usermod xz curl cc c++ make ar ld ps file; do
+            command -v "$executable" >/dev/null || { echo "Missing prepared prerequisite: $executable" >&2; exit 1; }
+          done
+          ! command -v go >/dev/null
+          ! command -v nix >/dev/null
+          ! command -v brew >/dev/null
+          test ! -e /nix
+          test ! -e /home/linuxbrew/.linuxbrew
+        '
+      - task: lima:snapshot
+
+  lima:ubuntu:assert-noop:
+    internal: true
+    cmds:
+      - |
+        set -eu
+        stdout=$(mktemp)
+        stderr=$(mktemp)
+        trap 'rm -f "$stdout" "$stderr"' EXIT
+        set +e
+        limactl shell {{.LIMA_INSTANCE}} -- {{.LIMA_WORKDIR}}/{{.EXECUTABLE}} install {{.INSTALL_ARGS}} >"$stdout" 2>"$stderr"
+        status=$?
+        set -e
+        if test "$status" -ne 0 || test -s "$stdout" || test -s "$stderr"; then
+          test ! -s "$stdout" || { echo 'Unexpected repeated-command stdout:' >&2; cat "$stdout" >&2; }
+          test ! -s "$stderr" || { echo 'Unexpected repeated-command stderr:' >&2; cat "$stderr" >&2; }
+          echo "Repeated command exited $status; expected quiet exit 0" >&2
+          exit 1
+        fi
+
+  lima:ubuntu:verify:nix:
+    desc: Verify Nix version, daemon, baseline, and a public flake operation
+    cmd: |
+      limactl shell {{.LIMA_INSTANCE}} -- bash -lc '
+        set -eu
+        nix={{.NIX_EXECUTABLE}}
+        "$nix" --version
+        "$nix" --extra-experimental-features nix-command store ping --store daemon
+        features=$(HOME=/var/empty XDG_CONFIG_HOME=/var/empty "$nix" config show experimental-features)
+        printf "%s\n" "$features" | grep -Eq "(^|[[:space:]])nix-command([[:space:]]|$)"
+        printf "%s\n" "$features" | grep -Eq "(^|[[:space:]])flakes([[:space:]]|$)"
+        "$nix" flake metadata github:NixOS/nixpkgs --no-write-lock-file >/dev/null
+      '
+
+  lima:ubuntu:verify:homebrew:
+    desc: Verify canonical Homebrew and regular-user prefix ownership
+    cmd: |
+      limactl shell {{.LIMA_INSTANCE}} -- bash -lc '
+        set -eu
+        brew={{.HOMEBREW_EXECUTABLE}}
+        "$brew" --version
+        test "$(stat -c %u /home/linuxbrew/.linuxbrew)" -eq "$(id -u)"
+        test "$(stat -c %u "$brew")" -eq "$(id -u)"
+      '
+
+  lima:ubuntu:test:nix:
+    desc: 'DESTRUCTIVE: restore clean Ubuntu, bootstrap the Nix install target twice, and verify it'
+    cmds:
+      - task: lima:reset
+      - task: lima:build
+      - ssh -tt -F {{.LIMA_SSH_CONFIG}} {{.LIMA_SSH_HOST}} {{.LIMA_WORKDIR}}/{{.EXECUTABLE}} install nix
+      - task: lima:ubuntu:assert-noop
+        vars: {INSTALL_ARGS: nix}
+      - task: lima:ubuntu:verify:nix
+
+  lima:ubuntu:test:homebrew:
+    desc: 'DESTRUCTIVE: restore clean Ubuntu, bootstrap the Homebrew install target twice, and verify it'
+    cmds:
+      - task: lima:reset
+      - task: lima:build
+      - ssh -tt -F {{.LIMA_SSH_CONFIG}} {{.LIMA_SSH_HOST}} {{.LIMA_WORKDIR}}/{{.EXECUTABLE}} install homebrew
+      - task: lima:ubuntu:assert-noop
+        vars: {INSTALL_ARGS: homebrew}
+      - task: lima:ubuntu:verify:homebrew
+
+  lima:ubuntu:test:default:
+    desc: 'DESTRUCTIVE: restore clean Ubuntu, bootstrap the default ordered set twice, and verify both targets'
+    cmds:
+      - task: lima:reset
+      - task: lima:build
+      - >-
+        limactl shell {{.LIMA_INSTANCE}} -- bash -lc
+        'rm -f /tmp/rig-install-order;
+        nohup bash -c '\''
+          : >/tmp/rig-install-order;
+          seen_nix=;
+          while :; do
+            if test -z "$seen_nix" && test -x {{.HOMEBREW_EXECUTABLE}}; then echo homebrew >>/tmp/rig-install-order; exit; fi;
+            if test -z "$seen_nix" && test -x {{.NIX_EXECUTABLE}}; then echo nix >>/tmp/rig-install-order; seen_nix=1; fi;
+            if test -x {{.HOMEBREW_EXECUTABLE}}; then echo homebrew >>/tmp/rig-install-order; exit; fi;
+            sleep 1;
+          done
+        '\'' >/dev/null 2>&1 &
+        while test ! -e /tmp/rig-install-order; do sleep 0.1; done'
+      - ssh -tt -F {{.LIMA_SSH_CONFIG}} {{.LIMA_SSH_HOST}} {{.LIMA_WORKDIR}}/{{.EXECUTABLE}} install
+      - task: lima:ubuntu:assert-noop
+        vars: {INSTALL_ARGS: ''}
+      - |
+        limactl shell {{.LIMA_INSTANCE}} -- bash -lc '
+          set -eu
+          attempts=0
+          while test "$(wc -l </tmp/rig-install-order)" -lt 2 && test "$attempts" -lt 10; do
+            attempts=$((attempts + 1))
+            sleep 1
+          done
+          test "$(cat /tmp/rig-install-order)" = "$(printf "nix\nhomebrew")"
+        '
+      - task: lima:ubuntu:verify:nix
+      - task: lima:ubuntu:verify:homebrew
+
+  lima:ubuntu:test:failure:
+    desc: 'DESTRUCTIVE: restore clean Ubuntu and prove failure stderr and exit-status evidence'
+    cmds:
+      - task: lima:reset
+      - task: lima:build
+      - |
+        set -eu
+        stdout=$(mktemp)
+        stderr=$(mktemp)
+        trap 'rm -f "$stdout" "$stderr"' EXIT
+        set +e
+        limactl shell {{.LIMA_INSTANCE}} -- {{.LIMA_WORKDIR}}/{{.EXECUTABLE}} install nix >"$stdout" 2>"$stderr"
+        status=$?
+        set -e
+        test "$status" -eq 1
+        test ! -s "$stdout"
+        grep -F 'nix bootstrap requires an interactive terminal' "$stderr" >/dev/null
+        cat "$stderr" >&2
+        echo "Observed expected exit status: $status" >&2
 
   lima:macos:create:
     desc: Create the macOS 26 (Tahoe) VM
@@ -119,6 +301,7 @@ tasks:
           LIMA_GUEST: macos
           LIMA_INSTANCE: rig-macos-26
           LIMA_TEMPLATE: macos-26
+          LIMA_VM_TYPE: vz
 
   lima:macos:shell:
     desc: Open a shell in the macOS 26 VM
