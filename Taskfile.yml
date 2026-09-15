@@ -5,8 +5,10 @@ vars:
   MAIN: .
   BIN_DIR: ~/.local/bin
   EXECUTABLE: rig
-  LIMA_INSTANCE: rig-ubuntu-2604
-  LIMA_TEMPLATE: ubuntu-26.04
+  # Override with LIMA_GUEST=macos to target macOS 26 (Tahoe).
+  LIMA_GUEST: ubuntu
+  LIMA_INSTANCE: '{{if eq .LIMA_GUEST "macos"}}rig-macos-26{{else}}rig-ubuntu-2604{{end}}'
+  LIMA_TEMPLATE: '{{if eq .LIMA_GUEST "macos"}}macos-26{{else}}ubuntu-26.04{{end}}'
   LIMA_WORKDIR: /tmp/rig
   LIMA_SNAPSHOT: clean
 tasks:
@@ -29,7 +31,10 @@ tasks:
     silent: true
 
   lima:create:
-    desc: Create an isolated Ubuntu 26.04 VM without host mounts
+    desc: Create an isolated VM (LIMA_GUEST=ubuntu or macos)
+    preconditions:
+      - sh: test "{{.LIMA_GUEST}}" = ubuntu || test "{{.LIMA_GUEST}}" = macos
+        msg: 'Unsupported LIMA_GUEST={{.LIMA_GUEST}}; use ubuntu or macos'
     cmd: >-
       limactl start
       --name {{.LIMA_INSTANCE}}
@@ -48,9 +53,13 @@ tasks:
     desc: Show the VM OS, architecture, and installer state
     cmd: >-
       limactl shell {{.LIMA_INSTANCE}} -- bash -lc
-      'cat /etc/os-release;
+      'if [ "$(uname -s)" = Darwin ]; then
+        sw_vers;
+      else
+        cat /etc/os-release;
+        systemctl is-system-running || true;
+      fi;
       uname -m;
-      systemctl is-system-running || true;
       command -v nix || echo "Nix not installed";
       command -v brew || echo "Homebrew not installed"'
 
@@ -101,3 +110,30 @@ tasks:
     cmds:
       - limactl stop {{.LIMA_INSTANCE}}
       - limactl delete {{.LIMA_INSTANCE}}
+
+  lima:macos:create:
+    desc: Create the macOS 26 (Tahoe) VM
+    cmds:
+      - task: lima:create
+        vars:
+          LIMA_GUEST: macos
+          LIMA_INSTANCE: rig-macos-26
+          LIMA_TEMPLATE: macos-26
+
+  lima:macos:shell:
+    desc: Open a shell in the macOS 26 VM
+    cmds:
+      - task: lima:shell
+        vars: {LIMA_INSTANCE: rig-macos-26}
+
+  lima:macos:info:
+    desc: Show the macOS 26 VM and installer state
+    cmds:
+      - task: lima:info
+        vars: {LIMA_INSTANCE: rig-macos-26}
+
+  lima:macos:delete:
+    desc: Delete the macOS 26 VM
+    cmds:
+      - task: lima:delete
+        vars: {LIMA_INSTANCE: rig-macos-26}
