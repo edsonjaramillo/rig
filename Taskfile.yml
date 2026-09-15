@@ -1,0 +1,103 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+# https://taskfile.dev
+version: "3"
+vars:
+  MAIN: .
+  BIN_DIR: ~/.local/bin
+  EXECUTABLE: rig
+  LIMA_INSTANCE: rig-ubuntu-2604
+  LIMA_TEMPLATE: ubuntu-26.04
+  LIMA_WORKDIR: /tmp/rig
+  LIMA_SNAPSHOT: clean
+tasks:
+  default:
+    cmd: go run {{.MAIN}} {{.CLI_ARGS}}
+    silent: true
+  build:
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - go build -ldflags="-s -w -X github.com/edsonjaramillo/rig/internal/application.Version={{.VERSION}}" -o {{.BIN_DIR}}/{{.EXECUTABLE}} {{.MAIN}}
+    silent: true
+  test:
+    cmd: go test ./...
+    silent: true
+  lint:
+    cmd: golangci-lint run ./...
+    silent: true
+  format:
+    cmd: gofumpt -w .
+    silent: true
+
+  lima:create:
+    desc: Create an isolated Ubuntu 26.04 VM without host mounts
+    cmd: >-
+      limactl start
+      --name {{.LIMA_INSTANCE}}
+      --mount-none
+      --containerd=none
+      --cpus 4
+      --memory 4
+      --disk 30
+      template:{{.LIMA_TEMPLATE}}
+
+  lima:shell:
+    desc: Open a shell in the test VM
+    cmd: limactl shell {{.LIMA_INSTANCE}}
+
+  lima:info:
+    desc: Show the VM OS, architecture, and installer state
+    cmd: >-
+      limactl shell {{.LIMA_INSTANCE}} -- bash -lc
+      'cat /etc/os-release;
+      uname -m;
+      systemctl is-system-running || true;
+      command -v nix || echo "Nix not installed";
+      command -v brew || echo "Homebrew not installed"'
+
+  lima:snapshot:
+    desc: Snapshot the clean VM before running installers
+    cmd: limactl snapshot create {{.LIMA_INSTANCE}} --tag {{.LIMA_SNAPSHOT}}
+
+  lima:copy:
+    desc: Copy the current source tree into the VM
+    cmds:
+      - limactl shell {{.LIMA_INSTANCE}} -- rm -rf {{.LIMA_WORKDIR}}
+      - limactl copy -r . {{.LIMA_INSTANCE}}:{{.LIMA_WORKDIR}}
+
+  lima:build:
+    desc: Install Go in the VM, copy the source, and build rig
+    deps: [lima:copy]
+    cmds:
+      - limactl shell {{.LIMA_INSTANCE}} -- sudo apt-get update
+      - limactl shell {{.LIMA_INSTANCE}} -- sudo apt-get install -y golang-go
+      - >-
+        limactl shell {{.LIMA_INSTANCE}} -- bash -lc
+        'cd {{.LIMA_WORKDIR}} && go build -o {{.EXECUTABLE}} {{.MAIN}}'
+
+  lima:run:
+    desc: Run rig in the VM; pass arguments after --
+    cmd: >-
+      limactl shell {{.LIMA_INSTANCE}} -- bash -lc
+      'cd {{.LIMA_WORKDIR}} && sudo ./{{.EXECUTABLE}} {{.CLI_ARGS}}'
+
+  lima:verify:
+    desc: Verify Nix and Homebrew after installation
+    cmd: >-
+      limactl shell {{.LIMA_INSTANCE}} -- bash -lc
+      'nix --version;
+      brew --version;
+      nix doctor'
+
+  lima:reset:
+    desc: Restore the VM to its clean snapshot
+    cmds:
+      - limactl stop {{.LIMA_INSTANCE}}
+      - limactl snapshot apply {{.LIMA_INSTANCE}} --tag {{.LIMA_SNAPSHOT}}
+      - limactl start {{.LIMA_INSTANCE}}
+
+  lima:delete:
+    desc: Delete the disposable VM
+    prompt: This will delete the {{.LIMA_INSTANCE}} VM. Continue?
+    cmds:
+      - limactl stop {{.LIMA_INSTANCE}}
+      - limactl delete {{.LIMA_INSTANCE}}
