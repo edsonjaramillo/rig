@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 
 	"github.com/spf13/cobra"
 )
@@ -33,6 +34,10 @@ func Run(ctx context.Context, host Host, args []string, streams Streams) int {
 		writeUsageError(streams.Stderr, err)
 		return 2
 	}
+	var cancelled *cancellationError
+	if errors.As(err, &cancelled) {
+		return 130
+	}
 
 	_, _ = fmt.Fprintf(streams.Stderr, "Error: %s\n", err)
 	return 1
@@ -41,7 +46,16 @@ func Run(ctx context.Context, host Host, args []string, streams Streams) int {
 // Execute runs Rig against the local operating system and exits with its status.
 func Execute() {
 	streams := Streams{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr}
-	os.Exit(Run(context.Background(), NewOSHost(streams), os.Args[1:], streams))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	exitCode := Run(ctx, NewOSHost(streams), os.Args[1:], streams)
+	stop()
+	os.Exit(exitCode)
+}
+
+type cancellationError struct{}
+
+func (*cancellationError) Error() string {
+	return "installation cancelled"
 }
 
 func writeUsageError(stderr io.Writer, err error) {

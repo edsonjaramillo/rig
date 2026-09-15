@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
 	"runtime"
 	"strconv"
+	"strings"
+	"time"
 )
 
 // ErrNotFound reports that a requested executable or filesystem path does not exist.
@@ -39,6 +42,7 @@ type PathInfo struct {
 // Platform describes operating-system facts needed by installation preflight.
 type Platform struct {
 	OS           string
+	Distribution string
 	Architecture string
 	Version      string
 }
@@ -57,10 +61,11 @@ type Streams struct {
 
 // Command describes a child process crossing the host boundary.
 type Command struct {
-	Path string
-	Args []string
-	Env  []string
-	Dir  string
+	Path        string
+	Args        []string
+	Env         []string
+	Dir         string
+	Interactive bool
 	Streams
 }
 
@@ -86,12 +91,48 @@ type OSHost struct {
 
 // NewOSHost creates the production host boundary.
 func NewOSHost(streams Streams) *OSHost {
-	return &OSHost{streams: streams, client: http.DefaultClient}
+	return &OSHost{
+		streams: streams,
+		client: &http.Client{
+			CheckRedirect: func(request *http.Request, _ []*http.Request) error {
+				return requireHTTPS(request.URL)
+			},
+		},
+	}
 }
 
 // Platform returns local operating-system facts.
-func (h *OSHost) Platform(context.Context) (Platform, error) {
-	return Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}, nil
+func (h *OSHost) Platform(ctx context.Context) (Platform, error) {
+	platform := Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}
+	switch runtime.GOOS {
+	case "darwin":
+		output, err := exec.CommandContext(ctx, "/usr/bin/sw_vers", "-productVersion").Output()
+		if err != nil {
+			return Platform{}, fmt.Errorf("read macOS version: %w", err)
+		}
+		platform.Version = strings.TrimSpace(string(output))
+	case "linux":
+		contents, err := os.ReadFile("/etc/os-release")
+		if err != nil {
+			return Platform{}, fmt.Errorf("read operating-system release: %w", err)
+		}
+		values := parseOSRelease(string(contents))
+		platform.Distribution = values["ID"]
+		platform.Version = values["VERSION_ID"]
+	}
+	return platform, nil
+}
+
+func parseOSRelease(contents string) map[string]string {
+	values := make(map[string]string)
+	for _, line := range strings.Split(contents, "\n") {
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		values[key] = strings.Trim(strings.TrimSpace(value), "\"'")
+	}
+	return values
 }
 
 // User returns the current local user.
@@ -151,6 +192,13 @@ func (h *OSHost) InspectPath(path string) (PathInfo, error) {
 
 // Retrieve performs an HTTP GET through the production HTTP client.
 func (h *OSHost) Retrieve(ctx context.Context, address string) (HTTPResponse, error) {
+	parsed, err := url.Parse(address)
+	if err != nil {
+		return HTTPResponse{}, err
+	}
+	if err := requireHTTPS(parsed); err != nil {
+		return HTTPResponse{}, err
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 	if err != nil {
 		return HTTPResponse{}, err
@@ -159,11 +207,23 @@ func (h *OSHost) Retrieve(ctx context.Context, address string) (HTTPResponse, er
 	if err != nil {
 		return HTTPResponse{}, err
 	}
+	finalURL := response.Request.URL
+	if err := requireHTTPS(finalURL); err != nil {
+		_ = response.Body.Close()
+		return HTTPResponse{}, err
+	}
 	return HTTPResponse{
 		StatusCode: response.StatusCode,
-		FinalURL:   response.Request.URL.String(),
+		FinalURL:   finalURL.String(),
 		Body:       response.Body,
 	}, nil
+}
+
+func requireHTTPS(address *url.URL) error {
+	if address == nil || !strings.EqualFold(address.Scheme, "https") {
+		return errors.New("installer retrieval requires HTTPS")
+	}
+	return nil
 }
 
 // CreateTemp creates a securely permissioned temporary file.
@@ -186,15 +246,57 @@ func (h *OSHost) ValidateSudo(ctx context.Context) error {
 	return h.Run(ctx, Command{Path: "sudo", Args: []string{"-v"}, Streams: h.streams})
 }
 
-// Run executes a child process.
+// Run executes a child process. Interactive children remain in Rig's foreground
+// process group so the terminal delivers Ctrl-C to the installer and its children.
 func (h *OSHost) Run(ctx context.Context, command Command) error {
-	child := exec.CommandContext(ctx, command.Path, command.Args...)
+	if !command.Interactive {
+		child := exec.CommandContext(ctx, command.Path, command.Args...)
+		configureChild(child, command)
+		return child.Run()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	child := exec.Command(command.Path, command.Args...)
+	configureChild(child, command)
+	if err := child.Start(); err != nil {
+		return err
+	}
+
+	completed := make(chan error, 1)
+	go func() {
+		completed <- child.Wait()
+	}()
+
+	select {
+	case err := <-completed:
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	case <-ctx.Done():
+		// A terminal interrupt already reached the whole foreground process group.
+		// Signalling the installer directly also handles programmatic cancellation.
+		_ = child.Process.Signal(os.Interrupt)
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-completed:
+		case <-timer.C:
+			_ = child.Process.Kill()
+			<-completed
+		}
+		return ctx.Err()
+	}
+}
+
+func configureChild(child *exec.Cmd, command Command) {
 	child.Env = command.Env
 	child.Dir = command.Dir
 	child.Stdin = command.Stdin
 	child.Stdout = command.Stdout
 	child.Stderr = command.Stderr
-	return child.Run()
 }
 
 // Bootstrap is the extension point for package-manager installation slices.

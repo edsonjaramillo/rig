@@ -10,38 +10,55 @@ import (
 )
 
 type fakeHost struct {
+	platform       Platform
+	platformError  error
+	user           User
+	userError      error
+	terminal       bool
 	lookPaths      map[string]string
 	lookPathErrors map[string]error
 	pathInfo       map[string]PathInfo
 	pathErrors     map[string]error
+	response       HTTPResponse
+	retrieveError  error
+	artifact       TemporaryArtifact
+	createTempErr  error
+	sudoError      error
 	runErrors      map[string]error
+	runHook        func(Command)
 	calls          []string
 	bootstrapped   []InstallTarget
 	bootstrapError error
 }
 
 func (h *fakeHost) Platform(context.Context) (Platform, error) {
-	panic("unexpected Platform call")
+	h.calls = append(h.calls, "platform")
+	return h.platform, h.platformError
 }
 
 func (h *fakeHost) User(context.Context) (User, error) {
-	panic("unexpected User call")
+	h.calls = append(h.calls, "user")
+	return h.user, h.userError
 }
 
 func (h *fakeHost) IsTerminal() bool {
-	panic("unexpected IsTerminal call")
+	h.calls = append(h.calls, "terminal")
+	return h.terminal
 }
 
-func (h *fakeHost) Retrieve(context.Context, string) (HTTPResponse, error) {
-	panic("unexpected Retrieve call")
+func (h *fakeHost) Retrieve(_ context.Context, address string) (HTTPResponse, error) {
+	h.calls = append(h.calls, "retrieve:"+address)
+	return h.response, h.retrieveError
 }
 
-func (h *fakeHost) CreateTemp(string) (TemporaryArtifact, error) {
-	panic("unexpected CreateTemp call")
+func (h *fakeHost) CreateTemp(pattern string) (TemporaryArtifact, error) {
+	h.calls = append(h.calls, "create-temp:"+pattern)
+	return h.artifact, h.createTempErr
 }
 
 func (h *fakeHost) ValidateSudo(context.Context) error {
-	panic("unexpected ValidateSudo call")
+	h.calls = append(h.calls, "sudo")
+	return h.sudoError
 }
 
 func (h *fakeHost) LookPath(name string) (string, error) {
@@ -65,6 +82,9 @@ func (h *fakeHost) InspectPath(path string) (PathInfo, error) {
 
 func (h *fakeHost) Run(_ context.Context, command Command) error {
 	h.calls = append(h.calls, "run:"+command.Path+" "+strings.Join(command.Args, " "))
+	if h.runHook != nil {
+		h.runHook(command)
+	}
 	return h.runErrors[command.Path]
 }
 
@@ -101,19 +121,20 @@ func TestInstallAcceptsIntendedCommandShapes(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		args []string
-		want []InstallTarget
+		name                     string
+		args                     []string
+		wantHostBootstrapTargets []InstallTarget
+		wantHomebrew             bool
 	}{
-		{name: "bare install", args: []string{"install"}, want: []InstallTarget{Nix, Homebrew}},
-		{name: "nix", args: []string{"install", "nix"}, want: []InstallTarget{Nix}},
-		{name: "homebrew", args: []string{"install", "homebrew"}, want: []InstallTarget{Homebrew}},
+		{name: "bare install", args: []string{"install"}, wantHostBootstrapTargets: []InstallTarget{Nix}, wantHomebrew: true},
+		{name: "nix", args: []string{"install", "nix"}, wantHostBootstrapTargets: []InstallTarget{Nix}},
+		{name: "homebrew", args: []string{"install", "homebrew"}, wantHomebrew: true},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			host := newFakeHost()
+			host, _, _ := newReadyHomebrewHost()
 
 			exitCode, stdout, stderr := executeForTest(host, test.args...)
 
@@ -123,8 +144,11 @@ func TestInstallAcceptsIntendedCommandShapes(t *testing.T) {
 			if stdout != "" || stderr != "" {
 				t.Fatalf("output = stdout %q, stderr %q; want silence", stdout, stderr)
 			}
-			if got := host.bootstrapped; !slices.Equal(got, test.want) {
-				t.Fatalf("bootstrapped = %v, want %v", got, test.want)
+			if got := host.bootstrapped; !slices.Equal(got, test.wantHostBootstrapTargets) {
+				t.Fatalf("host bootstrap targets = %v, want %v", got, test.wantHostBootstrapTargets)
+			}
+			if got := containsCallPrefix(host.calls, "run:/bin/bash"); got != test.wantHomebrew {
+				t.Fatalf("Homebrew installer called = %t, want %t; calls = %v", got, test.wantHomebrew, host.calls)
 			}
 		})
 	}
@@ -252,18 +276,18 @@ func TestInstallReportsPartialInstallationWithoutOverwritingIt(t *testing.T) {
 	}
 }
 
-func TestInstallAbsentTargetReachesInjectedBootstrapOperation(t *testing.T) {
+func TestInstallAbsentHomebrewReachesInjectedHostEffects(t *testing.T) {
 	t.Parallel()
 
-	host := newFakeHost()
+	host, _, _ := newReadyHomebrewHost()
 
 	exitCode, stdout, stderr := executeForTest(host, "install", "homebrew")
 
 	if exitCode != 0 || stdout != "" || stderr != "" {
 		t.Fatalf("result = (%d, %q, %q), want quiet success", exitCode, stdout, stderr)
 	}
-	if !slices.Equal(host.bootstrapped, []InstallTarget{Homebrew}) {
-		t.Fatalf("bootstrapped = %v, want [homebrew]", host.bootstrapped)
+	if !containsCallPrefix(host.calls, "run:/bin/bash") {
+		t.Fatalf("calls = %v, want Homebrew installer through injected host", host.calls)
 	}
 }
 

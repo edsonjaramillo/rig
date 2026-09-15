@@ -23,8 +23,8 @@ var installTargets = map[InstallTarget]installTargetSpec{
 	Homebrew: {
 		executable: "brew",
 		canonicalExecutables: []string{
-			"/opt/homebrew/bin/brew",
-			"/home/linuxbrew/.linuxbrew/bin/brew",
+			macOSHomebrewExecutable,
+			linuxHomebrewExecutable,
 			"/usr/local/bin/brew",
 		},
 		canonicalStateRoots: []string{
@@ -152,6 +152,9 @@ func ensureInstalled(ctx context.Context, host Host, streams Streams, target Ins
 		}
 	}
 
+	if target == Homebrew {
+		return bootstrapHomebrew(ctx, host, streams)
+	}
 	if err := host.Bootstrap(ctx, target, streams); err != nil {
 		return fmt.Errorf("bootstrap %s: %w", target, err)
 	}
